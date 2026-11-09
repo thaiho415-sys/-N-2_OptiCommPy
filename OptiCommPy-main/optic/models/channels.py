@@ -1,0 +1,672 @@
+"""
+==============================================================
+Models for fiber optic channels (:mod:`optic.models.channels`)
+==============================================================
+
+.. autosummary::
+   :toctree: generated/
+
+   linearFiberChannel   -- Linear optical fiber channel model.
+   ssfm                 -- Nonlinear fiber optic channel model based on the NLSE equation.
+   manakovSSF           -- Nonlinear fiber optic channel model based on the Manakov equation.
+   awgn                 -- AWGN channel model.
+"""
+
+"""Basic physical models for optical channels."""
+import logging as logg
+
+import numpy as np
+import scipy.constants as const
+from numba import njit
+from numpy.fft import fft, fftfreq, ifft
+from scipy.linalg import norm
+from tqdm.auto import tqdm
+
+from optic.dsp.core import gaussianComplexNoise, gaussianNoise, sigPow
+from optic.models.devices import edfa
+from optic.utils import parameters
+
+
+def linearFiberChannel(Ei, param):
+    r"""
+    Simulate signal propagation through a linear fiber channel.
+
+    Parameters
+    ----------
+    Ei : np.array
+        Input optical field.
+    param : optic.utils.parameters object
+        Physical/simulation parameters of the optical channel.
+
+        - param.L : total fiber length [km][default: 50 km]
+        - param.alpha : fiber attenuation parameter [dB/km][default: 0.2 dB/km]
+        - param.D : chromatic dispersion parameter [ps/nm/km][default: 17 ps/nm/km]
+        - param.Fc : carrier frequency [Hz] [default: 193.1e12 Hz]
+        - param.Fs : sampling frequency [Hz] [default: None]
+        - param.returnParameters : bool, return channel parameters [default: False]
+
+    Returns
+    -------
+    Eo : np.array
+        Optical field at the output of the fiber.
+
+    Notes
+    -----
+    In the linear regime, the propagation of the complex envelope :math:`A(z, t)` of
+    the optical field along the fiber is described by
+
+    .. math::
+        \frac{\partial A}{\partial z} = -\frac{\alpha}{2}A
+        - j\frac{\beta_2}{2}\frac{\partial^2 A}{\partial t^2}, \tag{1}
+
+    where :math:`\alpha` is the attenuation coefficient and :math:`\beta_2` is the
+    group velocity dispersion parameter. They are obtained from the fiber parameters
+    in engineering units as
+
+    .. math::
+        \alpha = \frac{\alpha_{dB}}{10\log_{10}e}, \qquad
+        \beta_2 = -\frac{D\lambda^2}{2\pi c}, \tag{2}
+
+    where :math:`\alpha_{dB}` is the loss in dB/km, :math:`D` is the dispersion
+    parameter, :math:`\lambda = c/F_c` is the carrier wavelength and :math:`c` is the
+    speed of light. In the frequency domain, Eq. (1) has the exact solution
+
+    .. math::
+        \tilde{A}(L, \omega) = \tilde{A}(0, \omega)
+        \exp\left(-\frac{\alpha}{2}L + j\frac{\beta_2}{2}\omega^2 L\right), \tag{3}
+
+    where :math:`\tilde{A}(z, \omega)` is the Fourier transform of :math:`A(z, t)` and
+    :math:`L` is the fiber length. The model is applied independently to each mode
+    (column) of the input field.
+
+    References
+    ----------
+    [1] G. P. Agrawal, Fiber-Optic Communication Systems. Wiley, 2021.
+
+    [2] S. J. Savory, “Digital coherent optical receivers: Algorithms and subsystems”, IEEE Journal on Selected Topics in Quantum Electronics, vol. 16, nº 5, p. 1164–1179, set. 2010, doi: 10.1109/JSTQE.2010.2044751.
+
+    """
+    try:
+        Fs = param.Fs
+    except AttributeError:
+        logg.error("Simulation sampling frequency (Fs) not provided.")
+
+    # check input parameters
+    param.L = getattr(param, "L", 50)
+    param.alpha = getattr(param, "alpha", 0.2)
+    param.D = getattr(param, "D", 17)
+    param.Fc = getattr(param, "Fc", 193.1e12)
+    param.returnParameters = getattr(param, "returnParameters", False)
+
+    L = param.L
+    alpha = param.alpha
+    D = param.D
+    Fc = param.Fc
+    returnParameters = param.returnParameters
+
+    # c  = 299792458   # speed of light [m/s](vacuum)
+    c_kms = const.c / 1e3
+    λ = c_kms / Fc
+    α = alpha / (10 * np.log10(np.exp(1)))
+    β2 = -(D * λ**2) / (2 * np.pi * c_kms)
+
+    Nfft = len(Ei)
+
+    ω = 2 * np.pi * Fs * fftfreq(Nfft)
+    ω = ω.reshape(ω.size, 1)
+
+    try:
+        Nmodes = Ei.shape[1]
+        input1D = False
+    except IndexError:
+        Nmodes = 1
+        Ei = Ei.reshape(Ei.size, Nmodes)
+        input1D = True
+
+    ω = np.tile(ω, (1, Nmodes))
+    Eo = ifft(fft(Ei, axis=0) * np.exp(-α / 2 * L + 1j * (β2 / 2) * (ω**2) * L), axis=0)
+
+    if Nmodes == 1:
+        Eo = Eo.reshape(
+            Eo.size,
+        )
+
+    if input1D:
+        # If the input was 1D, return a 1D array
+        Eo = Eo.flatten()
+
+    return (Eo, param) if returnParameters else Eo
+
+
+def ssfm(Ei, param=None):
+    r"""
+    Split-step Fourier method (symmetric, single-pol.).
+
+    Parameters
+    ----------
+    Ei : np.array
+        Input optical signal field.
+    param : optic.utils.parameters object
+        Physical/simulation parameters of the optical channel.
+
+        - param.Ltotal : total fiber length [km][default: 400 km]
+        - param.Lspan : span length [km][default: 80 km]
+        - param.hz : step-size for the split-step Fourier method [km][default: 0.5 km]
+        - param.alpha : fiber attenuation parameter [dB/km][default: 0.2 dB/km]
+        - param.D : chromatic dispersion parameter [ps/nm/km][default: 16 ps/nm/km]
+        - param.gamma : fiber nonlinear parameter [1/W/km][default: 1.3 1/W/km]
+        - param.Fc : carrier frequency [Hz] [default: 193.1e12 Hz]
+        - param.Fs : simulation sampling frequency [samples/second][default: None]
+        - param.prec : numerical precision [default: np.complex128]
+        - param.amp : 'edfa', 'ideal', or 'None. [default:'edfa']
+        - param.NF : edfa noise figure [dB] [default: 4.5 dB]
+        - param.seed : seed for the random number generator [default: None]
+        - param.prgsBar : display progress bar? bolean variable [default:True]
+        - param.returnParameters : bool, return channel parameters [default: False]
+
+    Returns
+    -------
+    Ech : np.array
+        Optical signal after nonlinear propagation.
+    param : optic.utils.parameters object
+        Object with physical/simulation parameters used in the split-step alg.
+
+    Notes
+    -----
+    The propagation of the complex envelope :math:`A(z, t)` of the optical field in a
+    single-mode fiber is described by the nonlinear Schrödinger equation (NLSE),
+
+    .. math::
+        \frac{\partial A}{\partial z} = -\frac{\alpha}{2}A
+        - j\frac{\beta_2}{2}\frac{\partial^2 A}{\partial t^2}
+        + j\gamma|A|^2A, \tag{1}
+
+    where :math:`\alpha` is the attenuation coefficient, :math:`\beta_2` is the group
+    velocity dispersion parameter (see :func:`linearFiberChannel`), and :math:`\gamma`
+    is the nonlinear parameter. Writing Eq. (1) as
+    :math:`\partial A/\partial z = (\hat{D} + \hat{N})A`, where :math:`\hat{D}`
+    accounts for loss and dispersion and :math:`\hat{N} = j\gamma|A|^2` for the Kerr
+    nonlinearity, the symmetric split-step Fourier method (SSFM) advances the field
+    by a step :math:`h` as
+
+    .. math::
+        A(z+h, t) \approx e^{\frac{h}{2}\hat{D}}\, e^{h\hat{N}}\,
+        e^{\frac{h}{2}\hat{D}} A(z, t). \tag{2}
+
+    The linear operator :math:`e^{\frac{h}{2}\hat{D}}` is applied in the frequency
+    domain, where it is the multiplication by
+    :math:`\exp\left[\left(-\frac{\alpha}{2} + j\frac{\beta_2}{2}\omega^2\right)\frac{h}{2}\right]`,
+    and the nonlinear operator is applied in the time domain, where it is the phase
+    rotation :math:`\exp\left(j\gamma|A|^2h\right)`. The approximation in Eq. (2)
+    has a global error of order :math:`h^2`. The link is composed of spans of length
+    :math:`L_{span}`, each one followed by an optical amplifier with gain
+    :math:`\alpha_{dB}L_{span}` dB, which compensates the span loss.
+
+    References
+    ----------
+    [1] G. P. Agrawal, Nonlinear Fiber Optics, Elsevier Science, 2013.
+
+    [2] O. V. Sinkin, R. Holzlöhner, J. Zweck, e C. R. Menyuk, “Optimization of the split-step Fourier method in modeling optical-fiber communications systems”, Journal of Lightwave Technology, vol. 21, nº 1, p. 61–68, jan. 2003, doi: 10.1109/JLT.2003.808628.
+
+    """
+    try:
+        Fs = param.Fs
+    except AttributeError:
+        logg.error("Simulation sampling frequency (Fs) not provided.")
+
+    # check input parameters
+    param.Ltotal = getattr(param, "Ltotal", 400)
+    param.Lspan = getattr(param, "Lspan", 80)
+    param.hz = getattr(param, "hz", 0.5)
+    param.alpha = getattr(param, "alpha", 0.2)
+    param.D = getattr(param, "D", 16)
+    param.gamma = getattr(param, "gamma", 1.3)
+    param.Fc = getattr(param, "Fc", 193.1e12)
+    param.prec = getattr(param, "prec", np.complex128)
+    param.amp = getattr(param, "amp", "edfa")
+    param.NF = getattr(param, "NF", 4.5)
+    param.seed = getattr(param, "seed", None)
+    param.prgsBar = getattr(param, "prgsBar", True)
+    param.returnParameters = getattr(param, "returnParameters", False)
+
+    Ltotal = param.Ltotal
+    Lspan = param.Lspan
+    hz = param.hz
+    alpha = param.alpha
+    D = param.D
+    gamma = param.gamma
+    Fc = param.Fc
+    prec = param.prec
+    amp = param.amp
+    NF = param.NF
+    seed = param.seed
+    prgsBar = param.prgsBar
+    returnParameters = param.returnParameters
+
+    # channel parameters
+    c_kms = const.c / 1e3  # speed of light (vacuum) in km/s
+    λ = c_kms / Fc
+    α = alpha / (10 * np.log10(np.exp(1)))
+    β2 = -(D * λ**2) / (2 * np.pi * c_kms)
+    γ = gamma
+
+    # edfa parameters
+    paramAmp = parameters()
+    paramAmp.G = alpha * Lspan
+    paramAmp.NF = NF
+    paramAmp.Fc = Fc
+    paramAmp.Fs = Fs
+    paramAmp.seed = seed
+
+    # generate frequency axis
+    Nfft = len(Ei)
+    ω = 2 * np.pi * Fs * fftfreq(Nfft)
+
+    Nspans = int(np.floor(Ltotal / Lspan))
+    Nsteps = int(np.floor(Lspan / hz))
+
+    Ech = Ei.reshape(
+        len(Ei),
+    )
+
+    # define linear operator
+    linOperator = np.exp(-(α / 2) * (hz / 2) + 1j * (β2 / 2) * (ω**2) * (hz / 2))
+
+    for _ in tqdm(range(1, Nspans + 1), disable=not (prgsBar)):
+        Ech = fft(Ech)  # single-polarization field
+
+        # fiber propagation step
+        for _ in range(1, Nsteps + 1):
+            # First linear step (frequency domain)
+            Ech = Ech * linOperator
+
+            # Nonlinear step (time domain)
+            Ech = ifft(Ech)
+            Ech = Ech * np.exp(1j * γ * (Ech * np.conj(Ech)) * hz)
+
+            # Second linear step (frequency domain)
+            Ech = fft(Ech)
+            Ech = Ech * linOperator
+
+        # amplification step
+        Ech = ifft(Ech)
+        if amp == "edfa":
+            Ech = edfa(Ech, paramAmp)
+        elif amp == "ideal":
+            Ech = Ech * np.exp(α / 2 * Nsteps * hz)
+        elif amp is None:
+            Ech = Ech * np.exp(0)
+
+    return (
+        (
+            Ech.reshape(
+                len(Ech),
+            ),
+            param,
+        )
+        if returnParameters
+        else Ech
+    )
+
+
+def manakovSSF(Ei, param):
+    r"""
+    Run the Manakov split-step Fourier model (symmetric, dual-pol.).
+
+    Parameters
+    ----------
+    Ei : np.array
+        Input optical signal field.
+    param : optic.utils.parameters object
+        Physical/simulation parameters of the optical channel.
+
+        - param.Ltotal : total fiber length [km][default: 400 km]
+        - param.Lspan : span length [km][default: 80 km]
+        - param.hz : step-size for the split-step Fourier method [km][default: 0.5 km]
+        - param.alpha : fiber attenuation parameter [dB/km][default: 0.2 dB/km]
+        - param.D : chromatic dispersion parameter [ps/nm/km][default: 16 ps/nm/km]
+        - param.gamma : fiber nonlinear parameter [1/W/km][default: 1.3 1/W/km]
+        - param.Fc : carrier frequency [Hz] [default: 193.1e12 Hz]
+        - param.Fs : simulation sampling frequency [samples/second][default: None]
+        - param.prec : numerical precision [default: np.complex128]
+        - param.amp : 'edfa', 'ideal', or 'None. [default:'edfa']
+        - param.NF : edfa noise figure [dB] [default: 4.5 dB]
+        - param.maxIter : max number of iter. in the trap. integration [default: 10]
+        - param.tol : convergence tol. of the trap. integration.[default: 1e-5]
+        - param.nlprMethod : adap step-size based on nonl. phase rot. [default: True]
+        - param.maxNlinPhaseRot : max nonl. phase rot. tolerance [rad][default: 2e-2]
+        - param.prgsBar : display progress bar? bolean variable [default:True]
+        - param.saveSpanN : specify the span indexes to be outputted [default:[]]
+        - param.seed : seed for the random number generator [default: None]
+        - param.returnParameters : bool, return channel parameters [default: False]
+
+    Returns
+    -------
+    Ech : np.array
+        Optical signal after nonlinear propagation.
+    param : optic.utils.parameters object
+        Object with physical/simulation parameters used in the split-step alg.
+
+    Notes
+    -----
+    In fibers with random birefringence, the propagation of the two polarization
+    components :math:`A_x(z, t)` and :math:`A_y(z, t)` of the optical field, averaged
+    over the fast random evolution of the state of polarization, is described by the
+    Manakov equations,
+
+    .. math::
+        \frac{\partial A_{x,y}}{\partial z} = -\frac{\alpha}{2}A_{x,y}
+        - j\frac{\beta_2}{2}\frac{\partial^2 A_{x,y}}{\partial t^2}
+        + j\frac{8}{9}\gamma\left(|A_x|^2 + |A_y|^2\right)A_{x,y}, \tag{1}
+
+    where :math:`\alpha`, :math:`\beta_2` and :math:`\gamma` are defined as in
+    :func:`ssfm`, and the factor :math:`8/9` results from the averaging of the
+    nonlinear interaction over the Poincaré sphere. Eq. (1) is solved with a
+    symmetric split-step Fourier method: in each step of length :math:`h`, a linear
+    half-step is followed by a nonlinear phase rotation and another linear half-step.
+    The nonlinear phase rotation, common to both polarizations,
+
+    .. math::
+        \phi_{NL}(t) = \frac{8}{9}\gamma\,
+        \frac{P(z, t) + P(z+h, t)}{2}\,h, \qquad P = |A_x|^2 + |A_y|^2, \tag{2}
+
+    uses the trapezoidal rule to approximate the integral of the power over the step.
+    Since :math:`P(z+h, t)` depends on the result of the step itself, the step is
+    iterated until the relative change of the fields falls below the tolerance
+    ``tol``. When ``nlprMethod`` is enabled, the step size is adapted along the
+    fiber so that the maximum nonlinear phase rotation per step,
+    :math:`\max_t \phi_{NL}(t)`, is equal to ``maxNlinPhaseRot``. Each span of length
+    :math:`L_{span}` is followed by an optical amplifier that compensates its loss.
+
+    References
+    ----------
+    [1] D. Marcuse, C. R. Menyuk, e P. K. A. Wai, “Application of the Manakov-PMD equation to studies of signal propagation in optical fibers with randomly varying birefringence”, Journal of Lightwave Technology, vol. 15, nº 9, p. 1735–1745, 1997, doi: 10.1109/50.622902.
+
+    [2] P. Serena, C. Lasagni, S. Musetti, e A. Bononi, “On Numerical Simulations of Ultra-Wideband Long-Haul Optical Communication Systems”, Journal of Lightwave Technology, vol. 38, nº 5, p. 1019–1031, 2020, doi: 10.1109/JLT.2019.2938580.
+
+    [3] O. V. Sinkin, R. Holzlöhner, J. Zweck, e C. R. Menyuk, “Optimization of the split-step Fourier method in modeling optical-fiber communications systems”, Journal of Lightwave Technology, vol. 21, nº 1, p. 61–68, jan. 2003, doi: 10.1109/JLT.2003.808628.
+
+    """
+    try:
+        Fs = param.Fs
+    except AttributeError:
+        logg.error("Simulation sampling frequency (Fs) not provided.")
+
+    # check input parameters
+    param.Ltotal = getattr(param, "Ltotal", 400)
+    param.Lspan = getattr(param, "Lspan", 80)
+    param.hz = getattr(param, "hz", 0.5)
+    param.alpha = getattr(param, "alpha", 0.2)
+    param.D = getattr(param, "D", 16)
+    param.gamma = getattr(param, "gamma", 1.3)
+    param.Fc = getattr(param, "Fc", 193.1e12)
+    param.prec = getattr(param, "prec", np.complex128)
+    param.amp = getattr(param, "amp", "edfa")
+    param.NF = getattr(param, "NF", 4.5)
+    param.maxIter = getattr(param, "maxIter", 10)
+    param.tol = getattr(param, "tol", 1e-5)
+    param.nlprMethod = getattr(param, "nlprMethod", True)
+    param.maxNlinPhaseRot = getattr(param, "maxNlinPhaseRot", 2e-2)
+    param.seed = getattr(param, "seed", None)
+    param.prgsBar = getattr(param, "prgsBar", True)
+    param.saveSpanN = getattr(param, "saveSpanN", [param.Ltotal // param.Lspan])
+    param.returnParameters = getattr(param, "returnParameters", False)
+
+    Ltotal = param.Ltotal
+    Lspan = param.Lspan
+    hz = param.hz
+    alpha = param.alpha
+    D = param.D
+    gamma = param.gamma
+    Fc = param.Fc
+    amp = param.amp
+    NF = param.NF
+    prec = param.prec
+    maxIter = param.maxIter
+    tol = param.tol
+    prgsBar = param.prgsBar
+    saveSpanN = param.saveSpanN
+    nlprMethod = param.nlprMethod
+    maxNlinPhaseRot = param.maxNlinPhaseRot
+    seed = param.seed
+    returnParameters = param.returnParameters
+
+    # channel parameters
+    c_kms = const.c / 1e3  # speed of light (vacuum) in km/s
+    λ = c_kms / Fc
+    α = alpha / (10 * np.log10(np.exp(1)))
+    β2 = -(D * λ**2) / (2 * np.pi * c_kms)
+    γ = gamma
+
+    # edfa parameters
+    paramAmp = parameters()
+    paramAmp.G = alpha * Lspan
+    paramAmp.NF = NF
+    paramAmp.Fc = Fc
+    paramAmp.Fs = Fs
+    paramAmp.seed = seed
+
+    # generate frequency axis
+    Nfft = len(Ei)
+    ω = 2 * np.pi * Fs * fftfreq(Nfft)
+
+    Nspans = int(np.floor(Ltotal / Lspan))
+
+    Ech_x = Ei[:, 0::2].T
+    Ech_y = Ei[:, 1::2].T
+
+    # define static part of the linear operator
+    argLimOp = np.array(-(α / 2) + 1j * (β2 / 2) * (ω**2)).astype(prec)
+
+    if Ech_x.shape[0] > 1:
+        argLimOp = np.tile(argLimOp, (Ech_x.shape[0], 1))
+    else:
+        argLimOp = argLimOp.reshape(1, -1)
+
+    if saveSpanN:
+        Ech_spans = np.zeros((Ei.shape[0], Ei.shape[1] * len(saveSpanN))).astype(prec)
+        indRecSpan = 0
+
+    logg.info(f"Running Manakov SSF model on CPU...")
+    for spanN in tqdm(range(1, Nspans + 1), disable=not (prgsBar)):
+        Ex_conv = Ech_x.copy()
+        Ey_conv = Ech_y.copy()
+
+        z_current = 0
+
+        # fiber propagation steps
+        while z_current < Lspan:
+            Pch = Ech_x * np.conj(Ech_x) + Ech_y * np.conj(Ech_y)
+
+            phiRot = nlinPhaseRot(Ex_conv, Ey_conv, Pch, γ)
+
+            if nlprMethod:
+                hz_ = (
+                    maxNlinPhaseRot / np.max(phiRot)
+                    if Lspan - z_current >= maxNlinPhaseRot / np.max(phiRot)
+                    else Lspan - z_current
+                )
+            elif Lspan - z_current < hz:
+                hz_ = Lspan - z_current  # check that the remaining
+                # distance is not less than hz (due to non-integer
+                # steps/span)
+            else:
+                hz_ = hz
+
+            # define the linear operator
+            linOperator = np.exp(argLimOp * (hz_ / 2))
+
+            # First linear step (frequency domain)
+            Ex_hd = ifft(fft(Ech_x) * linOperator)
+            Ey_hd = ifft(fft(Ech_y) * linOperator)
+
+            # Nonlinear step (time domain)
+            for nIter in range(maxIter):
+                rotOperator = np.exp(1j * phiRot * hz_)
+
+                Ech_x_fd = Ex_hd * rotOperator
+                Ech_y_fd = Ey_hd * rotOperator
+
+                # Second linear step (frequency domain)
+                Ech_x_fd = ifft(fft(Ech_x_fd) * linOperator)
+                Ech_y_fd = ifft(fft(Ech_y_fd) * linOperator)
+
+                # check convergence o trapezoidal integration in phiRot
+                lim = convergenceCondition(Ech_x_fd, Ech_y_fd, Ex_conv, Ey_conv)
+
+                Ex_conv = Ech_x_fd.copy()
+                Ey_conv = Ech_y_fd.copy()
+
+                if lim < tol:
+                    break
+                elif nIter == maxIter - 1:
+                    logg.warning(
+                        f"Warning: target SSFM error tolerance was not achieved in {maxIter} iterations"
+                    )
+
+                phiRot = nlinPhaseRot(Ex_conv, Ey_conv, Pch, γ)
+
+            Ech_x = Ech_x_fd.copy()
+            Ech_y = Ech_y_fd.copy()
+
+            z_current += hz_  # update propagated distance
+        # amplification step
+        if amp == "edfa":
+            Ech_x = edfa(Ech_x, paramAmp)
+            Ech_y = edfa(Ech_y, paramAmp)
+        elif amp == "ideal":
+            Ech_x = Ech_x * np.exp(α / 2 * Lspan)
+            Ech_y = Ech_y * np.exp(α / 2 * Lspan)
+        elif amp is None:
+            Ech_x = Ech_x * np.exp(0)
+            Ech_y = Ech_y * np.exp(0)
+
+        if spanN in saveSpanN:
+            Ech_spans[:, 2 * indRecSpan : 2 * indRecSpan + 1] = Ech_x.T
+            Ech_spans[:, 2 * indRecSpan + 1 : 2 * indRecSpan + 2] = Ech_y.T
+            indRecSpan += 1
+
+    if saveSpanN:
+        Ech = Ech_spans
+    else:
+        Ech = Ei.copy()
+        Ech[:, 0::2] = Ech_x.T
+        Ech[:, 1::2] = Ech_y.T
+
+    if returnParameters:
+        return Ech, param
+    else:
+        return Ech
+
+
+@njit
+def nlinPhaseRot(Ex, Ey, Pch, γ):
+    """
+    Calculate nonlinear phase-shift per step for the Manakov SSFM.
+
+    Parameters
+    ----------
+    Ex : np.array
+        Input optical signal field of x-polarization.
+    Ey : np.array
+        Input optical signal field of y-polarization.
+    Pch : np.array
+        Input optical power.
+    γ : real scalar
+        fiber nonlinearity coefficient.
+
+    Returns
+    -------
+    np.array
+        nonlinear phase-shift of each sample of the signal.
+
+    """
+    return ((8 / 9) * γ * (Pch + Ex * np.conj(Ex) + Ey * np.conj(Ey)) / 2).real
+
+
+def convergenceCondition(Ex_fd, Ey_fd, Ex_conv, Ey_conv):
+    """
+    Verify the convergence condition for the trapezoidal integration.
+
+    Parameters
+    ----------
+    Ex_fd : np.array
+        field of x-polarization fully dispersed and rotated.
+    Ey_fd : np.array
+        field of y-polarization fully dispersed and rotated.
+    Ex_conv : np.array
+        field of x-polarization at the begining of the step.
+    Ey_conv : np.array
+        Ifield of y-polarization at the begining of the step.
+
+    Returns
+    -------
+    scalar
+        squared root of the MSE normalized by the power of the fields.
+
+    """
+    return np.sqrt(norm(Ex_fd - Ex_conv) ** 2 + norm(Ey_fd - Ey_conv) ** 2) / np.sqrt(
+        norm(Ex_conv) ** 2 + norm(Ey_conv) ** 2
+    )
+
+
+def awgn(sig, param):
+    r"""
+    Implement a basic AWGN channel model.
+
+    Parameters
+    ----------
+    sig : np.array
+        Input signal.
+
+    param : optic.utils.parameters object
+        Physical/simulation parameters of the AWGN channel.
+
+            - param.snr : signal-to-noise ratio [dB][default: 20 dB]
+            - param.Fs : simulation sampling frequency [samples/second][default: 1]
+            - param.B : signal bandwidth [Hz][default: 1]
+            - param.complexNoise : boolean variable, add complex noise? [default: True]
+            - param.seed : seed for the random number generator [default: None]
+
+    Returns
+    -------
+    np.array
+        Input signal plus noise.
+
+    Notes
+    -----
+    Complex (or real) white Gaussian noise :math:`n[k]` is added to the signal,
+    :math:`y[k] = x[k] + n[k]`. The signal-to-noise ratio is defined within the signal
+    bandwidth :math:`B`,
+
+    .. math::
+        \mathrm{SNR} = \frac{P_x}{\sigma_B^2}, \tag{1}
+
+    where :math:`P_x` is the average power of the signal and :math:`\sigma_B^2` is the
+    power of the noise within :math:`B`. Since the noise is white over the simulation
+    bandwidth :math:`F_s` (the sampling frequency), its total power is
+
+    .. math::
+        \sigma^2 = \frac{F_s}{B}\,\frac{P_x}{\mathrm{SNR}}. \tag{2}
+
+    References
+    ----------
+    [1] P. Massoud Salehi e J. Proakis, Digital Communications. McGraw-Hill Education, 2007.
+
+    """
+    snr = getattr(param, "snr", 20)
+    Fs = getattr(param, "Fs", 1)
+    B = getattr(param, "B", 1)
+    complexNoise = getattr(param, "complexNoise", True)
+    seed = getattr(param, "seed", None)
+
+    snr_lin = 10 ** (snr / 10)
+    noiseVar = sigPow(sig) / snr_lin
+    σ2 = (Fs / B) * noiseVar
+
+    if complexNoise:
+        noise = gaussianComplexNoise(sig.shape, σ2, seed)
+    else:
+        noise = gaussianNoise(sig.shape, σ2, seed)
+
+    return sig + noise

@@ -1,0 +1,85 @@
+"""
+==========================================================================================
+Functions adapted to run with GPU (CuPy) processing (:mod:`optic.dsp.carrierRecoveryGPU`)
+==========================================================================================
+
+.. autosummary::
+   :toctree: generated/
+   :nosignatures:
+
+   bpsGPU -- Blind phase search (BPS) carrier phase recovery algorithm.
+"""
+
+import warnings
+
+import cupy as cp
+
+with warnings.catch_warnings():
+    # cupyx.scipy.signal uses the experimental cupyx.jit.rawkernel internally
+    warnings.filterwarnings(
+        "ignore", "cupyx.jit.rawkernel is experimental", FutureWarning
+    )
+    from cupyx.scipy.signal import oaconvolve
+
+
+def bpsGPU(sigIn, N, constSymb, B):
+    r"""
+    Blind phase search (BPS) algorithm
+
+    Parameters
+    ----------
+    sigIn : complex-valued np.array
+        Received constellation symbols.
+    N : int
+        Half of the 2*N+1 average window.
+    constSymb : complex-valued np.array
+        Complex-valued constellation.
+    B : int
+        number of test phases.
+
+    Returns
+    -------
+    θ : real-valued np.array
+        Time-varying estimated phase-shifts.
+
+    Notes
+    -----
+    This is the GPU (CuPy) implementation of the blind phase search algorithm: for
+    :math:`B` test phases :math:`\varphi_b = \frac{b}{B}\frac{\pi}{2}`, the squared
+    distances between the rotated symbols :math:`y[k]e^{j\varphi_b}` and the closest
+    constellation points are summed over a window of :math:`2N+1` symbols, and the
+    test phase with the smallest sum is selected. See
+    :func:`optic.dsp.carrierRecovery.bps` for the description of the algorithm.
+
+    References
+    ----------
+    [1] T. Pfau, S. Hoffmann, e R. Noé, “Hardware-efficient coherent digital receiver concept with feedforward carrier recovery for M-QAM constellations”, Journal of Lightwave Technology, vol. 27, nº 8, p. 989–999, 2009, doi: 10.1109/JLT.2008.2010511.
+    """
+    sigIn = cp.asarray(sigIn)
+    constSymb = cp.asarray(constSymb)
+
+    ϕ_test = cp.arange(0, B) * (cp.pi / 2) / B  # test phases
+    kernel = cp.ones((2 * N + 1, 1, 1))
+
+    nModes = sigIn.shape[1]
+    zeroPad = cp.zeros((N, nModes))
+
+    sigIn = cp.concatenate(
+        (zeroPad, sigIn, zeroPad)
+    )  # pad start and end of the signal with zeros
+
+    Ei_rotated = sigIn[:, :, cp.newaxis] * cp.exp(1j * ϕ_test)[None, None, :]
+
+    dist = (
+        cp.absolute(
+            cp.subtract(Ei_rotated[:, :, :, None], constSymb[None, None, None, :])
+        )
+        ** 2
+    )
+
+    dmin = cp.min(dist, axis=3)
+    sumDmin = oaconvolve(dmin, kernel, mode="valid")
+
+    indRot = cp.argmin(sumDmin, axis=2)
+
+    return cp.asnumpy(ϕ_test[indRot])

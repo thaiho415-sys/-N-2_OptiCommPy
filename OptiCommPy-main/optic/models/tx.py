@@ -1,0 +1,385 @@
+"""
+=================================================================
+Advanced models for optical transmitters (:mod:`optic.models.tx`)
+=================================================================
+
+.. autosummary::
+   :toctree: generated/
+
+   simpleWDMTx          -- Implements a simple optical WDM transmitter.
+   pamTransmitter       -- Implements an optical PAM signal transmitter.
+"""
+
+import numpy as np
+from tqdm.auto import tqdm
+
+from optic.comm.modulation import grayMapping
+from optic.comm.sources import symbolSource
+from optic.dsp.core import (
+    phaseNoise,
+    pnorm,
+    pulseShape,
+    upsample,
+)
+from optic.models.devices import iqm, mzm
+from optic.utils import dBm2W, parameters
+
+try:
+    from optic.dsp.coreGPU import checkGPU
+
+    if checkGPU():
+        from optic.dsp.coreGPU import firFilter
+    else:
+        from optic.dsp.core import firFilter
+except ImportError:
+    from optic.dsp.core import firFilter
+
+import logging as logg
+
+
+def simpleWDMTx(param):
+    r"""
+    Implement a simple WDM transmitter.
+
+    Generates a complex baseband waveform representing a WDM signal with
+    arbitrary number of carriers
+
+    Parameters
+    ----------
+    param : optic.core.parameter object
+         Parameters of the WDM transmitter.
+
+        - param.M : modulation order [default: 16].
+        - param.constType : 'qam' or 'psk' [default: 'qam'].
+        - param.Rs : carrier baud rate [baud][default: 32e9].
+        - param.SpS : samples per symbol [default: 16].
+        - param.probDist : pmf type of the symbol source, either 'uniform' or 'maxwell-boltzmann' [default: 'uniform'].
+        - param.shapingFactor : shaping factor of the symbols [default: 0].
+        - param.seed : seed for the random number generator [default: None].
+        - param.nBits : total number of bits per carrier [default: 60000].
+        - param.pulseType : pulse shape ['nrz', 'rrc'][default: 'rrc'].
+        - param.nFilterTaps : number of coefficients of the rrc filter [default: 1024].
+        - param.pulseRollOff : rolloff do rrc filter [default: 0.01].
+        - param.mzmScale : MZM modulation scale factor Vrf/Vpi [default: 0.5].
+        - param.powerPerChannel : launched power per WDM channel [dBm][default:-3 dBm].
+        - param.nChannels : number of WDM channels [default: 5].
+        - param.Fc : central frequency of the WDM spectrum [Hz][default: 193.1e12 Hz].
+        - param.laserLinewidth : laser linewidth [Hz][default: 0 Hz].
+        - param.wdmGridSpacing : frequency spacing of the WDM grid [Hz][default: 50e9 Hz].
+        - param.nPolModes : number of polarization modes [default: 1].
+        - param.prgsBar : display progress bar? [default: True].
+
+    Returns
+    -------
+    sigTxWDM : np.array
+        WDM signal.
+    symbTxWDM : np.array
+        Array of symbols per WDM carrier.
+    param : optic.core.parameter object
+        System parameters for the WDM transmitter.
+
+    Notes
+    -----
+    The WDM signal is the sum of :math:`N_{ch}` independently modulated channels,
+    each one centered at a frequency :math:`f_k` of the WDM grid with spacing
+    :math:`\Delta f`, relative to the central frequency :math:`F_c`,
+
+    .. math::
+        E_{WDM}(t) = \sum_{k=1}^{N_{ch}} \sqrt{P_k}\;s_k(t)\,e^{j2\pi f_k t}, \qquad
+        f_k = \left(k - \frac{N_{ch}+1}{2}\right)\Delta f, \tag{1}
+
+    where :math:`P_k` is the launch power of the :math:`k`-th channel and
+    :math:`s_k(t)` is its normalized (unit power) optical field. Each channel is
+    generated as follows: random symbols, uniformly or Maxwell-Boltzmann distributed,
+    are upsampled and pulse shaped, and the resulting baseband signal drives an IQ
+    modulator (see :func:`optic.models.devices.iqm`) that modulates the field of a
+    laser with phase noise of linewidth :math:`\Delta\nu` (see
+    :func:`optic.dsp.core.phaseNoise`). With :math:`N_{pol}` polarization modes, each
+    mode carries independent symbols and the power :math:`P_k/N_{pol}`.
+    """
+    # check input parameters
+    param.M = getattr(param, "M", 16)
+    param.constType = getattr(param, "constType", "qam")
+    param.Rs = getattr(param, "Rs", 32e9)
+    param.SpS = getattr(param, "SpS", 16)
+    param.probDist = getattr(param, "probDist", "uniform")
+    param.shapingFactor = getattr(param, "shapingFactor", 0)
+    param.seed = getattr(param, "seed", None)
+    param.nBits = getattr(param, "nBits", 60000)
+    param.pulseType = getattr(param, "pulseType", "rrc")
+    param.nFilterTaps = getattr(param, "nFilterTaps", 1024)
+    param.pulseRollOff = getattr(param, "pulseRollOff", 0.01)
+    param.mzmScale = getattr(param, "mzmScale", 0.5)
+    param.powerPerChannel = getattr(param, "powerPerChannel", -3)
+    param.nChannels = getattr(param, "nChannels", 5)
+    param.Fc = getattr(param, "Fc", 193.1e12)
+    param.laserLinewidth = getattr(param, "laserLinewidth", 0)
+    param.wdmGridSpacing = getattr(param, "wdmGridSpacing", 50e9)
+    param.nPolModes = getattr(param, "nPolModes", 1)
+    param.prgsBar = getattr(param, "prgsBar", True)
+
+    # transmitter parameters
+    Ts = 1 / param.Rs  # symbol period [s]
+    Fs = 1 / (Ts / param.SpS)  # sampling frequency [samples/s]
+    nSymbols = int(param.nBits / np.log2(param.M))  # number of symbols per mode
+
+    # get constellation pmf
+    constSymb = grayMapping(param.M, param.constType)
+    if param.probDist == "uniform":
+        px = np.ones(param.M) / param.M
+    elif param.probDist == "maxwell-boltzmann":
+        px = np.exp(-param.shapingFactor * np.abs(constSymb) ** 2)
+        px = px / np.sum(px)
+    else:
+        raise ValueError("Invalid probability distribution.")
+    param.pmf = px
+
+    # Symbol source parameters
+    paramSymb = parameters()
+    paramSymb.nSymbols = param.nBits // int(np.log2(param.M))
+    paramSymb.M = param.M
+    paramSymb.constType = param.constType
+    paramSymb.dist = param.probDist
+    paramSymb.shapingFactor = param.shapingFactor
+
+    # Pulse shaping filter parameters
+    paramPulse = parameters()
+    paramPulse.pulseType = param.pulseType
+    paramPulse.nFilterTaps = param.nFilterTaps
+    paramPulse.rollOff = param.pulseRollOff
+    paramPulse.SpS = param.SpS
+
+    # pulse shaping filter
+    pulse = pulseShape(paramPulse)
+
+    # central frequencies of the WDM channels
+    freqGrid = (
+        np.arange(-np.floor(param.nChannels / 2), np.floor(param.nChannels / 2) + 1, 1)
+        * param.wdmGridSpacing
+    )
+
+    if (param.nChannels % 2) == 0:
+        freqGrid += param.wdmGridSpacing / 2
+
+    if type(param.powerPerChannel) == list:
+        assert (
+            len(param.powerPerChannel) == param.nChannels
+        ), "list length of power per channel does not match number of channels."
+        Pch = (
+            10 ** (np.array(param.powerPerChannel) / 10) * 1e-3
+        )  # optical signal power per WDM channel
+    else:
+        Pch = 10 ** (param.powerPerChannel / 10) * 1e-3
+        Pch = Pch * np.ones(param.nChannels)
+
+    π = np.pi
+    # time array
+    t = np.arange(0, int(nSymbols * param.SpS))
+
+    # allocate array
+    sigTxWDM = np.zeros((len(t), param.nPolModes), dtype="complex")
+    symbTxWDM = np.zeros(
+        (len(t) // param.SpS, param.nPolModes, param.nChannels), dtype="complex"
+    )
+
+    Psig = 0
+
+    if param.seed is not None:
+        seed = param.seed
+    else:
+        seed = None
+
+    for indCh in tqdm(range(param.nChannels), disable=not (param.prgsBar)):
+        logg.info(
+            "channel %d\t fc : %3.4f THz" % (indCh, (param.Fc + freqGrid[indCh]) / 1e12)
+        )
+
+        # generate LO field with phase noise, already shifted to the channel
+        # frequency (the IQM is linear in the LO field, so the frequency shift
+        # is computed once per channel instead of once per mode)
+        ϕ_pn_lo = phaseNoise(param.laserLinewidth, len(t), 1 / Fs, seed=param.seed)
+        sigLO = np.exp(1j * (ϕ_pn_lo + 2 * π * freqGrid[indCh] * (t * (1 / Fs))))
+
+        PchMode = Pch[indCh] / param.nPolModes  # optical signal power per mode
+
+        Pmode = 0
+        for indMode in range(param.nPolModes):
+            logg.info(
+                "  mode #%d\t power: %.2f dBm" % (indMode, 10 * np.log10(PchMode / 1e-3))
+            )
+
+            # Generate sequence of constellation symbols
+            paramSymb.seed = seed
+            symbTx = symbolSource(paramSymb)
+
+            if param.seed is not None:
+                seed += 1  # increment seed for next pol/channel
+
+            symbTxWDM[:, indMode, indCh] = symbTx
+
+            # upsampling
+            symbolsUp = upsample(symbTx, param.SpS)
+
+            # pulse shaping
+            sigTx = firFilter(pulse, symbolsUp)
+
+            # optical modulation (driving signal normalized to amplitude mzmScale)
+            sigTxCh = iqm(sigLO, (param.mzmScale / np.max(np.abs(sigTx))) * sigTx)
+
+            # set the optical signal power of the mode
+            PsigTxCh = np.vdot(sigTxCh, sigTxCh).real / len(sigTxCh)
+            sigTxWDM[:, indMode] += np.sqrt(PchMode / PsigTxCh) * sigTxCh
+
+            Pmode += PchMode
+
+        Psig += Pmode
+
+        logg.info(
+            "channel %d\t power: %.2f dBm\n" % (indCh, 10 * np.log10(Pmode / 1e-3))
+        )
+
+    logg.info("total WDM signal power: %.2f dBm" % (10 * np.log10(Psig / 1e-3)))
+
+    param.wdmFreqGrid = freqGrid
+
+    return sigTxWDM, symbTxWDM, param
+
+
+def pamTransmitter(param):
+    r"""
+    Generate a optical PAM signal.
+
+    Parameters
+    ----------
+    param :  optic.core.parameter object
+         Parameters of the PAM transmitter.
+
+        - param.M : modulation order [default: 4].
+        - param.Rs : symbol rate [baud][default: 32e9].
+        - param.SpS : samples per symbol [default: 16].
+        - param.probDist : pmf type of the symbol source, either 'uniform' or 'maxwell-boltzmann' [default: 'uniform'].
+        - param.shapingFactor : shaping factor of the symbols [default: 0].
+        - param.seed : seed for the random number generator [default: None].
+        - param.nBits : total number of bits [default: 40000].
+        - param.pulseType : pulse shape ['nrz', 'rrc'][default: 'rrc'].
+        - param.nFilterTaps : number of coefficients of the rrc filter [default: 4096].
+        - param.pulseRollOff : rolloff do rrc filter [default: 0.01].
+        - param.mzmVpi : MZM Vpi [V][default: 3 V].
+        - param.mzmVb : MZM bias voltage [V][default: -1.5 V].
+        - param.mzmScale : MZM modulation scale factor Vrf/Vpi [default: 0.25].
+        - param.mzmER : MZM extinction ratio [dB][default: 80 dB].
+        - param.power : optical output power [dBm][default:-3 dBm].
+        - param.nPolModes : number of polarization modes [default: 1].
+        - param.returnParam : whether to return the parameter object [default: False].
+
+    Returns
+    -------
+    sigTx : np.array
+        PAM signal.
+    symbTx : np.array
+        Array of symbols.
+    param : optic.core.parameter object
+        System parameters for the PAM transmitter.
+
+    Notes
+    -----
+    The optical PAM signal is generated by intensity modulation of a continuous-wave
+    laser with a Mach-Zehnder modulator (see :func:`optic.models.devices.mzm`). The
+    PAM symbols are upsampled and pulse shaped, and the resulting signal
+    :math:`s(t)`, normalized to unit peak amplitude, drives the MZM as
+    :math:`u(t) = m V_\pi s(t)`, where :math:`m` is the modulation index
+    (``mzmScale``). For an ideal MZM biased at :math:`V_b`, the output field is
+
+    .. math::
+        E(t) \propto \cos\left[\frac{\pi}{2}\,\frac{u(t) + V_b}{V_\pi}\right], \tag{1}
+
+    (the finite extinction ratio of the modulator is also taken into account), and it
+    is finally scaled to the average optical power :math:`P`. At the quadrature bias,
+    :math:`V_b = -V_\pi/2` (the default), the optical power :math:`|E(t)|^2` varies
+    approximately linearly with small driving signals.
+    """
+    # check input parameters
+    param.M = getattr(param, "M", 4)
+    param.Rs = getattr(param, "Rs", 32e9)
+    param.SpS = getattr(param, "SpS", 16)
+    param.probDist = getattr(param, "probDist", "uniform")
+    param.shapingFactor = getattr(param, "shapingFactor", 0)
+    param.seed = getattr(param, "seed", None)
+    param.nBits = getattr(param, "nBits", 40000)
+    param.pulseType = getattr(param, "pulseType", "nrz")
+    param.nFilterTaps = getattr(param, "nFilterTaps", 256)
+    param.pulseRollOff = getattr(param, "pulseRollOff", 0.01)
+    param.mzmVpi = getattr(param, "mzmVpi", 3)
+    param.mzmVb = getattr(param, "mzmVb", 1.5)
+    param.mzmER = getattr(param, "mzmER", 80)
+    param.mzmScale = getattr(param, "mzmScale", 0.25)
+    param.nPolModes = getattr(param, "nPolModes", 1)
+    param.power = getattr(param, "power", -3)
+    param.returnParam = getattr(param, "returnParam", False)
+
+    # Symbol source parameters
+    paramSymb = parameters()
+    paramSymb.nSymbols = param.nBits // int(np.log2(param.M))
+    paramSymb.M = param.M
+    paramSymb.constType = "pam"
+    paramSymb.dist = param.probDist
+    paramSymb.shapingFactor = param.shapingFactor
+
+    # Pulse shaping filter parameters
+    paramPulse = parameters()
+    paramPulse.pulseType = param.pulseType
+    paramPulse.nFilterTaps = param.nFilterTaps
+    paramPulse.rollOff = param.pulseRollOff
+    paramPulse.SpS = param.SpS
+
+    # MZM parameters
+    paramMZM = parameters()
+    paramMZM.Vpi = param.mzmVpi
+    paramMZM.Vb = -param.mzmVb
+    paramMZM.ER = param.mzmER
+
+    # allocate array
+    sigTxo = np.zeros(
+        ((param.nBits * param.SpS) // int(np.log2(param.M)), param.nPolModes),
+        dtype=np.complex128,
+    )
+    symbTx = np.zeros(
+        ((param.nBits) // int(np.log2(param.M)), param.nPolModes), dtype=np.float64
+    )
+
+    for indMode in range(param.nPolModes):
+        if param.seed is not None:
+            seed = param.seed + indMode
+        else:
+            seed = None
+
+        # generate pseudo-random bit sequence
+        paramSymb.seed = seed
+        symbTx_ = symbolSource(paramSymb)
+
+        # upsampling
+        symbolsUp = upsample(symbTx_, param.SpS)
+
+        # pulse shaping filter
+        pulse = pulseShape(paramPulse)
+
+        # pulse shaping
+        sigTx = firFilter(pulse, symbolsUp)
+        sigTx = param.mzmVpi * sigTx / np.max(np.abs(sigTx))
+
+        # optical modulation
+        sigTxo_ = mzm(1, param.mzmScale * sigTx, paramMZM)
+
+        # adjust output power
+        sigTxo[:, indMode] = np.sqrt(dBm2W(param.power)) * pnorm(sigTxo_)
+        symbTx[:, indMode] = symbTx_
+
+    if param.nPolModes == 1:
+        sigTxo = sigTxo.reshape(
+            sigTxo.size,
+        )
+
+    if param.returnParam:
+        return sigTxo, symbTx, param
+    else:
+        return sigTxo, symbTx
