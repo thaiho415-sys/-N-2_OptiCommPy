@@ -29,3 +29,28 @@ Yêu cầu máy tính đã cài đặt **Python 3.10+** (dự án được phát
 4. Ghi nhận kết quả
    * Nếu cần quan sát từng kết quả: chạy từng cell code trong 4 file .jpynb của đề tài
    * Nếu cần lấy kết quả hình ảnh số liệu: python run_all_experiments.py => các file kết quả sẽ được lưu tự động vào thư mục **results/**
+## 4. Bộ tham số chính: 
+``` bash
+# Tham số tín hiệu & Thời gian
+param.Rs = 10e9          # Tốc độ ký hiệu: 10 GBaud (10 Gbps với OOK)
+param.SpS = 16           # Số mẫu trên 1 ký hiệu (Samples per symbol)
+param.Fs = param.Rs * param.SpS  # Tần số lấy mẫu (160 GHz)
+param.Nbits = 2**14      # Tổng số bit mô phỏng (16,384 bits)
+
+# Tham số Bộ điều chế Quang MZM (Khối phát)
+param.Vpi = 2.0          # Điện áp Vpi = 2V
+param.Vb = -1.0          # Điện áp Bias = -1V
+P_tx_dBm = 0             # Công suất quang phát: 0 dBm
+P_tx_W = dBm2W(P_tx_dBm) # Công suất phát quy đổi sang Watt (1e-3 W)
+
+# Tham số Kênh truyền Sợi quang (Fiber Channel)
+param.L = 20            # Chiều dài sợi quang: L km
+param.alpha = 0.2        # Hệ số suy hao: 0.2 dB/km
+param.D = 18.0           # Hệ số tán sắc sắc thể: 16 ps/nm/km
+param.lamda = 1550e-9    # Bước sóng hoạt động: 1550 nm
+
+# Tham số Bộ thu Quang Photodiode & Nhiễu (Receiver)
+param.R = 0.85           # Độ đáp ứng quang (Responsivity) = 0.85 A/W
+param.B = 0.75 * param.Rs # Băng thông bộ thu = 7.5 GHz
+T_temp = 300             # Nhiệt độ môi trường = 300 K
+R_load = 50              # Trở kháng tải = 50 Ohm
