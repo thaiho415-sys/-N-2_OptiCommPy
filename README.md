@@ -11,6 +11,8 @@ Toàn bộ mã nguồn thực nghiệm được đặt trong thư mục `OptiCom
 * `OptiCommPy-main/2_PAM4.ipynb`: Mở rộng mô phỏng tuyến truyền dẫn quang IM-DD sang định dạng điều chế 4-PAM.
 * `OptiCommPy-main/3_OOK có dùng photodiode.ipynb`: Tích hợp khối tách sóng quang (Photodiode) vào đầu thu cho hệ thống OOK để đánh giá thực tế hơn.
 * `OptiCommPy-main/4_PAM4 có dùng photodiode.ipynb`: Tích hợp khối tách sóng quang (Photodiode) cho hệ thống 4-PAM để đánh giá thực thế hơn
+* 1_OKK và 2_PAM4: nhiễu được tạo từ ngẫu nhiên theo mô hình toán học.
+* 3_OKK có dùng photodiode và 4_PAM4 có dùng photodiode: nhiễu thực tế hơn khi sử dụng hàm photodiode trong thư viện có sẵn
 * Cả 4 phần đều có mở rộng tính toán và so sánh BER theo cự ly.
   
 ## 3. Hướng dẫn cài đặt môi trường và cách chạy code: 
