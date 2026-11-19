@@ -21,11 +21,11 @@ Yêu cầu máy tính đã cài đặt **Python 3.10+** (dự án được phát
    git clone [https://github.com/thaiho415-sys/-N-2_OptiCommPy.git](https://github.com/thaiho415-sys/-N-2_OptiCommPy.git)
    (Hoặc tải trực tiếp file ZIP từ GitHub về giải nén và chạy trên máy tính cá nhân, ví dụ sử  VS Code).
 2. Mở Terminal và trỏ đến thư mục:
-   cd -N-2_OptiCommPy
-   cd OptiCommPy-main
+   * cd -N-2_OptiCommPy
+   * cd OptiCommPy-main
 3. Cài đặt các thư viện phụ thuộc và gói OptiCommPy
-   pip install -r requirements.txt
-   pip install -e .
+   * pip install -r requirements.txt
+   * pip install -e .
 4. Ghi nhận kết quả
    * Nếu cần quan sát từng kết quả: chạy từng cell code trong 4 file .jpynb của đề tài
    * Nếu cần lấy kết quả hình ảnh số liệu: python run_all_experiments.py => các file kết quả sẽ được lưu tự động vào thư mục **results/**
